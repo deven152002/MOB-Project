@@ -1,0 +1,29 @@
+Metadata-Version: 2.4
+Name: mother-of-bots
+Version: 0.1.0
+Summary: A multi-agent system for generating and deploying specialized chatbots
+Author: MOB Team
+Author-email: example@example.com
+Keywords: chatbot,multi-agent,llm
+Requires-Python: >=3.8
+Requires-Dist: spade>=3.3.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: aiohttp>=3.8.4
+Requires-Dist: requests>=2.30.0
+Requires-Dist: streamlit>=1.24.0
+Requires-Dist: nest-asyncio>=1.5.6
+Requires-Dist: watchdog>=3.0.0
+Requires-Dist: pdfplumber>=0.10.0
+Requires-Dist: python-docx>=0.8.11
+Requires-Dist: fastapi>=0.100.0
+Requires-Dist: uvicorn>=0.23.0
+Requires-Dist: sqlalchemy>=2.0.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: pytest>=7.4.0
+Requires-Dist: pytest-asyncio>=0.21.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: keywords
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
