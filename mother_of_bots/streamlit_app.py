@@ -5,13 +5,11 @@ import logging
 import os
 import uuid
 import nest_asyncio
-from agents.user_interaction import UserInteractionAgent, StandaloneUserInteractionAgent
-from agents.requirements_analyzer import analyze_requirements, analyze_and_format_for_code_generation
-from agents.code_generation_agent import StandaloneCodeGenerationAgent
-from agents.ui_generation_agent import StandaloneUIGenerationAgent
-from agents.integrator_agent import StandaloneIntegratorAgent
-from agents.deployer_agent import StandaloneDeployerAgent
+import httpx
+import gc
 from dotenv import load_dotenv
+from io import BytesIO
+from typing import Optional, Dict, List
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
@@ -26,15 +24,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Document processing imports
+try:
+    import PyPDF2
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    logger.warning("PyPDF2 not available. PDF processing will be disabled.")
+
+try:
+    from docx import Document as DocxDocument
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    logger.warning("python-docx not available. DOCX processing will be disabled.")
+
+try:
+    import openpyxl
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
+    logger.warning("openpyxl not available. Excel processing will be disabled.")
+
+# Note: .doc files are processed using LibreOffice (system dependency)
+# pypandoc is not used as it doesn't support .doc format directly
+
 # Configuration from environment variables
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:latest")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 
-# XMPP configuration (for SPADE)
-XMPP_JID = os.getenv("XMPP_JID", "user@localhost")
-XMPP_PASSWORD = os.getenv("XMPP_PASSWORD", "password")
-XMPP_SERVER = os.getenv("XMPP_SERVER", "localhost")
-XMPP_PORT = int(os.getenv("XMPP_PORT", "5222"))
+# FastAPI configuration
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 # Setup page config
 st.set_page_config(
@@ -174,24 +194,8 @@ if 'agent' not in st.session_state:
     st.session_state.user_id = f"user_{uuid.uuid4()}"
     st.session_state.waiting_for_response = False
     
-    # Check XMPP server connectivity before setting agent_type
-    default_agent_type = os.getenv("DEFAULT_AGENT_TYPE", "standalone")
-    if default_agent_type == "spade":
-        try:
-            import socket
-            xmpp_server = os.getenv("XMPP_SERVER", "localhost")
-            xmpp_port = int(os.getenv("XMPP_PORT", "5222"))
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
-            s.connect((xmpp_server, xmpp_port))
-            s.close()
-            st.session_state.agent_type = "spade"
-            logger.info(f"XMPP server available at {xmpp_server}:{xmpp_port}, using SPADE mode")
-        except Exception as e:
-            st.session_state.agent_type = "standalone"
-            logger.warning(f"XMPP server not available: {str(e)}. Defaulting to standalone mode")
-    else:
-        st.session_state.agent_type = default_agent_type
+    # Using FastAPI mode (no agent_type needed)
+    st.session_state.agent_type = "fastapi"
     
     st.session_state.show_analysis = True  # Show requirements analysis by default
     st.session_state.auto_generate_code = True  # Automatically generate code after analysis
@@ -199,6 +203,266 @@ if 'agent' not in st.session_state:
     st.session_state.deployer_agent = None  # Store deployer agent for stopping services
     st.session_state.backend_url = None  # Backend URL for deployed services
     st.session_state.frontend_url = None  # Frontend URL for deployed services
+    st.session_state.uploaded_documents = []  # Store uploaded documents
+
+# Document processing functions
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract text from PDF file"""
+    if not PDF_AVAILABLE:
+        return "PDF processing not available. Please install PyPDF2."
+    try:
+        pdf_file = BytesIO(file_bytes)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        logger.error(f"Error extracting text from PDF: {str(e)}")
+        return f"Error extracting text from PDF: {str(e)}"
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    """Extract text from DOCX file"""
+    if not DOCX_AVAILABLE:
+        return "DOCX processing not available. Please install python-docx."
+    try:
+        docx_file = BytesIO(file_bytes)
+        doc = DocxDocument(docx_file)
+        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        return text
+    except Exception as e:
+        logger.error(f"Error extracting text from DOCX: {str(e)}")
+        return f"Error extracting text from DOCX: {str(e)}"
+
+def extract_text_from_doc(file_bytes: bytes) -> str:
+    """Extract text from DOC file (old Word format) using LibreOffice conversion"""
+    import tempfile
+    import subprocess
+    
+    # Save to temporary file
+    tmp_doc_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.doc') as tmp_doc:
+            tmp_doc.write(file_bytes)
+            tmp_doc_path = tmp_doc.name
+        
+        # Get output directory
+        output_dir = os.path.dirname(tmp_doc_path)
+        
+        # Use LibreOffice to convert DOC to TXT
+        result = subprocess.run(
+            ['libreoffice', '--headless', '--convert-to', 'txt:Text', 
+             '--outdir', output_dir, tmp_doc_path],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0:
+            # Read the converted text file
+            txt_file_path = tmp_doc_path.replace('.doc', '.txt')
+            if os.path.exists(txt_file_path):
+                with open(txt_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    text = f.read()
+                # Clean up converted file
+                try:
+                    os.unlink(txt_file_path)
+                except:
+                    pass
+                return text
+            else:
+                raise Exception("LibreOffice conversion succeeded but output file not found")
+        else:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            raise Exception(f"LibreOffice conversion failed: {error_msg}")
+            
+    except subprocess.TimeoutExpired:
+        return (
+            "Error: Document conversion timed out.\n\n"
+            "Please try converting your .doc file to .docx format manually and upload it again."
+        )
+    except FileNotFoundError:
+        return (
+            "DOC file processing requires LibreOffice to be installed.\n\n"
+            "Install LibreOffice:\n"
+            "- macOS: brew install --cask libreoffice\n"
+            "- Linux: sudo apt-get install libreoffice\n"
+            "- Windows: Download from https://www.libreoffice.org/\n\n"
+            "After installing LibreOffice, restart the application.\n\n"
+            "Alternatively, you can convert your .doc file to .docx format and upload it again."
+        )
+    except Exception as e:
+        logger.error(f"Error extracting text from DOC: {str(e)}")
+        return (
+            f"Error processing .doc file: {str(e)}\n\n"
+            "Please try one of the following:\n"
+            "1. Convert your .doc file to .docx format and upload it again\n"
+            "2. Install LibreOffice for automatic conversion\n"
+            "3. Use an online converter to convert .doc to .docx"
+        )
+    finally:
+        # Clean up temp doc file
+        if tmp_doc_path and os.path.exists(tmp_doc_path):
+            try:
+                os.unlink(tmp_doc_path)
+            except:
+                pass
+
+def extract_text_from_excel(file_bytes: bytes) -> str:
+    """Extract text from Excel file"""
+    if not EXCEL_AVAILABLE:
+        return "Excel processing not available. Please install openpyxl."
+    try:
+        excel_file = BytesIO(file_bytes)
+        workbook = openpyxl.load_workbook(excel_file)
+        text = ""
+        for sheet_name in workbook.sheetnames:
+            sheet = workbook[sheet_name]
+            text += f"\n--- Sheet: {sheet_name} ---\n"
+            for row in sheet.iter_rows(values_only=True):
+                row_text = "\t".join([str(cell) if cell is not None else "" for cell in row])
+                if row_text.strip():
+                    text += row_text + "\n"
+        return text
+    except Exception as e:
+        logger.error(f"Error extracting text from Excel: {str(e)}")
+        return f"Error extracting text from Excel: {str(e)}"
+
+def detect_file_type_by_content(file_bytes: bytes) -> str:
+    """Detect file type by checking magic bytes/file signature"""
+    if len(file_bytes) < 4:
+        return "unknown"
+    
+    # Check for ZIP-based formats (DOCX, XLSX are ZIP files)
+    if file_bytes[:2] == b'PK':
+        # Check if it's a DOCX (has word/document.xml)
+        try:
+            import zipfile
+            with zipfile.ZipFile(BytesIO(file_bytes)) as zf:
+                if 'word/document.xml' in zf.namelist():
+                    return "docx"
+                elif any(f.startswith('xl/') for f in zf.namelist()):
+                    return "xlsx"
+        except:
+            pass
+    
+    # Check for PDF
+    if file_bytes[:4] == b'%PDF':
+        return "pdf"
+    
+    # Check for old Word format (OLE compound document)
+    if file_bytes[:8] == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+        return "doc"
+    
+    # Check if it's plain text (readable ASCII/UTF-8)
+    try:
+        file_bytes[:1000].decode('utf-8')
+        return "text"
+    except:
+        pass
+    
+    return "unknown"
+
+def extract_text_from_file(file_bytes: bytes, file_type: str, file_name: str = "") -> str:
+    """Extract text from various file types"""
+    file_type_lower = file_type.lower()
+    file_name_lower = file_name.lower() if file_name else ""
+    
+    # First, try to detect actual file type by content (magic bytes)
+    detected_type = detect_file_type_by_content(file_bytes)
+    
+    # Check file extension first (more reliable than MIME type)
+    if file_name_lower.endswith(".pdf") or file_type_lower.endswith("pdf") or detected_type == "pdf":
+        return extract_text_from_pdf(file_bytes)
+    elif file_name_lower.endswith(".doc") or detected_type == "doc":
+        # Old Word format (.doc) - use LibreOffice
+        return extract_text_from_doc(file_bytes)
+    elif file_name_lower.endswith(".docx") or file_type_lower == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" or detected_type == "docx":
+        # New Word format (.docx) - use python-docx
+        # But first check if it's actually a valid DOCX (zip file)
+        try:
+            import zipfile
+            zipfile.ZipFile(BytesIO(file_bytes))
+            return extract_text_from_docx(file_bytes)
+        except Exception as e:
+            # Not a valid DOCX, might be a .doc file misidentified or plain text
+            logger.warning(f"File {file_name} identified as DOCX but is not a valid zip file. Detected type: {detected_type}")
+            
+            # If detected as text, try to read as text
+            if detected_type == "text":
+                try:
+                    return file_bytes.decode('utf-8')
+                except:
+                    pass
+            
+            # Try as DOC file
+            logger.info(f"Trying to process {file_name} as DOC file")
+            return extract_text_from_doc(file_bytes)
+    elif file_type_lower == "application/msword":
+        # MIME type says .doc
+        return extract_text_from_doc(file_bytes)
+    elif file_name_lower.endswith(("xlsx", "xls")) or file_type_lower in ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             "application/vnd.ms-excel"] or detected_type == "xlsx":
+        return extract_text_from_excel(file_bytes)
+    elif file_type_lower.startswith("text/") or detected_type == "text" or file_name_lower.endswith(".txt"):
+        # Plain text files
+        try:
+            return file_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                return file_bytes.decode('latin-1')
+            except Exception as e:
+                return f"Error decoding text file: {str(e)}"
+    else:
+        # Last resort: try to decode as text if it looks like text
+        if detected_type == "text":
+            try:
+                return file_bytes.decode('utf-8')
+            except:
+                pass
+        return f"Unsupported file type: {file_type}. Detected type: {detected_type}. Supported types: PDF, DOC, DOCX, TXT, XLSX"
+
+def process_uploaded_file(uploaded_file) -> Optional[Dict]:
+    """Process an uploaded file and return document info with memory limits"""
+    try:
+        # Limit file size to prevent memory issues (50MB max)
+        max_file_size = 50 * 1024 * 1024  # 50MB
+        file_bytes = uploaded_file.read()
+        
+        if len(file_bytes) > max_file_size:
+            error_msg = f"File {uploaded_file.name} is too large ({len(file_bytes) / 1024 / 1024:.1f}MB). Maximum size is 50MB."
+            logger.error(error_msg)
+            st.error(error_msg)
+            return None
+        
+        file_type = uploaded_file.type
+        file_name = uploaded_file.name
+        
+        # Extract text from file (pass file_name for better detection)
+        text_content = extract_text_from_file(file_bytes, file_type, file_name)
+        
+        # Limit extracted text content to prevent memory issues (100KB max per document)
+        max_text_length = 100 * 1024  # 100KB
+        if len(text_content) > max_text_length:
+            text_content = text_content[:max_text_length] + f"\n\n[Document content truncated - extracted {max_text_length} characters of {len(text_content)} total]"
+            logger.warning(f"Document {file_name} content truncated from {len(text_content)} to {max_text_length} characters")
+        
+        return {
+            "name": file_name,
+            "type": file_type,
+            "size": len(file_bytes),
+            "content": text_content,
+            "preview": text_content[:500] + "..." if len(text_content) > 500 else text_content
+        }
+    except MemoryError:
+        error_msg = f"Not enough memory to process file {uploaded_file.name}. Please try a smaller file."
+        logger.error(error_msg)
+        st.error(error_msg)
+        return None
+    except Exception as e:
+        logger.error(f"Error processing uploaded file: {str(e)}")
+        st.error(f"Error processing file: {str(e)}")
+        return None
 
 # Create a simple synchronous wrapper for async functions
 def run_async(coro):
@@ -213,140 +477,125 @@ def run_async(coro):
             raise
 
 def initialize_agent():
-    """Initialize the agent in the session state based on selected type"""
-    if st.session_state.agent is None:
-        try:
-            if st.session_state.agent_type == "spade":
-                # Create SPADE agent with XMPP for multi-agent system
-                st.session_state.agent = UserInteractionAgent(
-                    jid=XMPP_JID, 
-                    password=XMPP_PASSWORD, 
-                    name="StreamlitSPADEAgent"
-                )
-                logger.info(f"Initializing SPADE agent with JID: {XMPP_JID}")
-            else:
-                # Create standalone agent (no XMPP) for single-agent use
-                st.session_state.agent = StandaloneUserInteractionAgent(name="StreamlitStandaloneAgent")
-                logger.info("Initializing standalone agent (no XMPP)")
-            
-            # Start the agent asynchronously
-            run_async(st.session_state.agent.start() if hasattr(st.session_state.agent, 'start') else st.session_state.agent.setup())
-            st.session_state.agent_running = True
-            logger.info(f"Agent initialized with model: {OLLAMA_MODEL}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to initialize agent: {str(e)}")
-            st.error(f"Agent initialization failed: {str(e)}")
-            return False
+    """No longer needed - using FastAPI instead"""
+    st.session_state.agent_running = True
+    logger.info("Using FastAPI for all operations")
     return True
 
 def end_agent_session():
-    """End the agent session"""
-    if st.session_state.agent and st.session_state.agent_running:
-        try:
-            if hasattr(st.session_state.agent, 'stop'):
-                run_async(st.session_state.agent.stop())
-            else:
-                # For SPADE agents, stop is automatically handled
-                pass
-            st.session_state.agent_running = False
-            st.session_state.agent = None
-            logger.info("Agent session ended")
-            
-            # Also stop any running deployed services
-            if st.session_state.deployer_agent:
-                run_async(st.session_state.deployer_agent.stop())
-                st.session_state.deployer_agent = None
-                st.session_state.backend_url = None
-                st.session_state.frontend_url = None
-                logger.info("Deployer agent stopped and services terminated")
-                
+    """Stop any running deployed services"""
+    try:
+        # Stop any running deployed services
+        if st.session_state.deployer_agent:
+            run_async(st.session_state.deployer_agent.stop())
+            st.session_state.deployer_agent = None
+            st.session_state.backend_url = None
+            st.session_state.frontend_url = None
+            logger.info("Deployed services stopped")
             return True
-        except Exception as e:
-            logger.error(f"Error stopping agent: {str(e)}")
-            return False
+    except Exception as e:
+        logger.error(f"Error stopping services: {str(e)}")
+        return False
     return True
 
+async def call_fastapi_endpoint(endpoint: str, payload: dict):
+    """Call a FastAPI endpoint asynchronously with memory-efficient handling"""
+    # Limit payload size to prevent memory issues
+    if "message" in payload:
+        max_message_length = 15000  # Limit total message length
+        if len(payload["message"]) > max_message_length:
+            logger.warning(f"Message too long ({len(payload['message'])} chars), truncating to {max_message_length}")
+            payload["message"] = payload["message"][:max_message_length] + "\n\n[Message truncated due to size limits]"
+    
+    async with httpx.AsyncClient(timeout=600.0) as client:  # Increased timeout to 10 minutes
+        try:
+            response = await client.post(f"{API_BASE_URL}{endpoint}", json=payload)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            # Try to get error details from response
+            error_detail = "Unknown error"
+            try:
+                error_response = e.response.json()
+                error_detail = error_response.get("detail", str(e))
+                logger.error(f"API returned error: {error_detail}")
+            except:
+                error_detail = f"HTTP {e.response.status_code}: {e.response.text[:500]}"
+                logger.error(f"API error (non-JSON): {error_detail}")
+            raise Exception(f"API Error: {error_detail}")
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error calling {endpoint}: {str(e)}")
+            raise Exception(f"Connection error: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error calling {endpoint}: {str(e)}")
+            raise
+
 async def get_requirements_analysis(message):
-    """Get requirements analysis directly"""
-    return await analyze_requirements(message)
+    """Get requirements analysis via FastAPI"""
+    try:
+        result = await call_fastapi_endpoint("/api/analyze-requirements", {
+            "message": message,
+            "output_format": "text"
+        })
+        return result.get("result", "")
+    except Exception as e:
+        logger.error(f"Error getting requirements analysis: {str(e)}")
+        return f"Error analyzing requirements: {str(e)}"
 
 async def direct_requirements_to_code(message):
-    """Analyze requirements and directly generate code without user interaction using SPADE agents"""
-    logger.info(f"Analyzing requirements and generating code for: {message[:50]}...")
+    """
+    Complete chatbot creation workflow:
+    1. Analyze requirements from user input (and documents if provided)
+    2. Generate backend code (FastAPI/Python)
+    3. Generate UI code (React/TailwindCSS) 
+    4. Integrate into a complete project structure
+    5. Deploy to local servers
+    
+    This enables a chatbot to create another chatbot seamlessly.
+    """
+    logger.info(f"Analyzing requirements and generating code via FastAPI for: {message[:50]}...")
     
     try:
-        # SPADE-based multi-agent approach when in SPADE mode
-        if st.session_state.agent_type == "spade":
-            try:
-                from agents.integration_example import process_user_request
-                
-                logger.info("Using SPADE multi-agent system for code generation")
-                # Check if XMPP server is reachable first
-                import socket
-                try:
-                    xmpp_server = os.getenv("XMPP_SERVER", "localhost")
-                    xmpp_port = int(os.getenv("XMPP_PORT", "5222"))
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(2)
-                    s.connect((xmpp_server, xmpp_port))
-                    s.close()
-                    logger.info(f"Successfully connected to XMPP server at {xmpp_server}:{xmpp_port}")
-                except Exception as e:
-                    logger.error(f"Cannot connect to XMPP server: {str(e)}")
-                    raise ConnectionError(f"XMPP server not available at {xmpp_server}:{xmpp_port}")
-                
-                # Use the SPADE multi-agent system from integration_example
-                results = process_user_request(message, mode="spade")
-                
-                # Extract the results
-                req_text = results.get("requirements_text", "No requirements analysis generated")
-                generated_code = results.get("generated_code", None)
-                generated_ui = results.get("generated_ui", None)
-                needs_ui = results.get("needs_ui", False)
-                project_dir = results.get("project_dir", None)
-                backend_url = results.get("backend_url", None)
-                frontend_url = results.get("frontend_url", None)
-                
-                # Log project generation details
-                if project_dir and os.path.exists(project_dir):
-                    logger.info(f"Project successfully generated at: {project_dir}")
-                    # Log directory contents for debugging
-                    try:
-                        logger.info(f"Project directory contents: {os.listdir(project_dir)}")
-                        backend_dir = os.path.join(project_dir, "backend")
-                        frontend_dir = os.path.join(project_dir, "frontend")
-                        if os.path.exists(backend_dir):
-                            logger.info(f"Backend directory contents: {os.listdir(backend_dir)}")
-                        if os.path.exists(frontend_dir):
-                            logger.info(f"Frontend directory contents: {os.listdir(frontend_dir)}")
-                    except Exception as e:
-                        logger.error(f"Error listing project contents: {str(e)}")
-                else:
-                    logger.error(f"Project directory not found or not created: {project_dir}")
-                
-                # Store the URLs if deployment was successful
-                if backend_url and frontend_url:
-                    st.session_state.backend_url = backend_url
-                    st.session_state.frontend_url = frontend_url
-                    logger.info(f"Deployment successful - Backend: {backend_url}, Frontend: {frontend_url}")
-                else:
-                    logger.warning("Deployment URLs not available - services may not be running")
-                
-                if needs_ui and generated_ui:
-                    logger.info(f"UI code generated via SPADE: {len(generated_ui)} characters")
-                    
-                if generated_code:
-                    logger.info(f"Code generated via SPADE: {len(generated_code)} characters")
-                    
-                    # Format output based on whether we have UI code or not
-                    if needs_ui and generated_ui:
-                        # We have both backend and UI code
-                        project_info = ""
-                        if project_dir:
-                            deployment_info = ""
-                            if st.session_state.deploy_services and backend_url and frontend_url:
-                                deployment_info = f"""
+        # Use FastAPI full workflow endpoint - this orchestrates all agents
+        logger.info("Calling FastAPI /api/generate-full-project endpoint")
+        result = await call_fastapi_endpoint("/api/generate-full-project", {
+            "message": message,
+            "output_format": "text"
+        })
+        
+        if result.get("status") != "success":
+            error_msg = result.get("detail", "Unknown error")
+            logger.error(f"FastAPI workflow failed: {error_msg}")
+            return f"Error generating project: {error_msg}", None
+        
+        # Extract results
+        req_analysis = result.get("requirements_analysis", {})
+        req_text = req_analysis.get("text", "Requirements analysis completed")
+        req_json = req_analysis.get("json", {})
+        
+        generated = result.get("generated_code", {})
+        backend_code = generated.get("backend", "")
+        ui_code = generated.get("ui", "")
+        
+        project_info = result.get("project", {})
+        project_dir = project_info.get("directory")
+        
+        deployment = result.get("deployment", {})
+        backend_url = deployment.get("backend_url")
+        frontend_url = deployment.get("frontend_url")
+        
+        # Store deployment URLs if available
+        if backend_url and frontend_url:
+            st.session_state.backend_url = backend_url
+            st.session_state.frontend_url = frontend_url
+            logger.info(f"Deployment successful - Backend: {backend_url}, Frontend: {frontend_url}")
+        
+        # Format project info
+        project_info_text = ""
+        if project_dir and project_info.get("exists"):
+            deployment_info = ""
+            if st.session_state.deploy_services and backend_url and frontend_url:
+                deployment_info = f"""
 ## Deployment
 Your application has been deployed and is running at:
 
@@ -355,8 +604,8 @@ Your application has been deployed and is running at:
 
 The services will remain running until you close this application or click "Stop Services" in the sidebar.
 """
-                            
-                            project_info = f"""
+            
+            project_info_text = f"""
 ## Project Integration
 A complete project has been assembled at: `{project_dir}`
 
@@ -365,186 +614,20 @@ A complete project has been assembled at: `{project_dir}`
 - A README.md with setup instructions is included
 {deployment_info}
 """
-                        
-                        return req_text, {
-                            "backend_code": generated_code,
-                            "ui_code": generated_ui,
-                            "project_info": project_info
-                        }
-                    else:
-                        # We only have backend code
-                        return req_text, generated_code
-                else:
-                    logger.error("SPADE-based code generation failed")
-                    # Fall back to standalone mode
-                    logger.info("Falling back to standalone mode")
-            except Exception as e:
-                logger.error(f"Error using SPADE mode: {str(e)}")
-                st.sidebar.error(f"SPADE mode failed: {str(e)}. Falling back to standalone mode.")
-                # Automatically switch to standalone mode
-                st.session_state.agent_type = "standalone"
-                logger.info("Switched to standalone mode due to SPADE error")
         
-        # Standalone approach (used as fallback or when not in SPADE mode)
-        # Analyze requirements and get both text and JSON formats
-        req_text, req_json = await analyze_and_format_for_code_generation(message)
-        
-        if not isinstance(req_json, dict) or not req_json:
-            logger.error("Failed to generate valid JSON requirements for code generation")
-            return req_text, None
-        
-        logger.info(f"Requirements analyzed successfully: {list(req_json.keys())}")
-        
-        # Detect if UI generation is needed
-        needs_ui = _check_if_ui_needed(req_json, req_text)
-        
-        # Create and initialize code generation agent
-        code_agent = StandaloneCodeGenerationAgent()
-        await code_agent.start()
-        
-        # Create and initialize UI generation agent if needed
-        ui_agent = None
-        if needs_ui:
-            logger.info("UI generation is needed based on requirements")
-            ui_agent = StandaloneUIGenerationAgent()
-            await ui_agent.start()
-        
-        # Create and initialize integrator agent
-        integrator_agent = StandaloneIntegratorAgent()
-        await integrator_agent.start()
-        
-        # Also initialize deployer agent if user wants to deploy services
-        deployer_agent = None
-        if st.session_state.deploy_services:
-            deployer_agent = StandaloneDeployerAgent()
-            await deployer_agent.start()
-            # Store the deployer agent in session state to stop it later
-            st.session_state.deployer_agent = deployer_agent
-            logger.info("Deployer agent initialized and ready to deploy services")
-        
-        try:
-            # Generate code and UI (if needed) in parallel
-            code_task = asyncio.create_task(code_agent.generate_code(req_json))
-            ui_task = asyncio.create_task(ui_agent.generate_ui_code(req_json)) if needs_ui else None
+        # Return results
+        if ui_code and len(ui_code.strip()) > 10:
+            return req_text, {
+                "backend_code": backend_code,
+                "ui_code": ui_code,
+                "project_info": project_info_text
+            }
+        else:
+            return req_text, backend_code
             
-            # Wait for backend code
-            generated_code = await code_task
-            if not generated_code or len(generated_code.strip()) < 10:
-                logger.warning("Code generation produced empty or very short result")
-                return req_text, None
-                
-            logger.info(f"Backend code generated successfully: {len(generated_code)} characters")
-            
-            # Wait for UI code if applicable
-            generated_ui = None
-            if ui_task:
-                generated_ui = await ui_task
-                if generated_ui and len(generated_ui.strip()) > 10:
-                    logger.info(f"UI code generated successfully: {len(generated_ui)} characters")
-                else:
-                    logger.warning("UI generation produced empty or very short result")
-            
-            # Integrate the project if we have both components
-            project_dir = None
-            project_info = ""
-            backend_url = None
-            frontend_url = None
-            
-            if generated_code and (not needs_ui or (needs_ui and generated_ui)):
-                # Integrate the project
-                logger.info("Starting project integration...")
-                project_dir = await integrator_agent.integrate_project(generated_code, generated_ui or "", req_json)
-                if project_dir and os.path.exists(project_dir):
-                    logger.info(f"Project integrated successfully at {project_dir}")
-                    # Log directory contents for debugging
-                    try:
-                        logger.info(f"Project directory contents: {os.listdir(project_dir)}")
-                        backend_dir = os.path.join(project_dir, "backend")
-                        frontend_dir = os.path.join(project_dir, "frontend")
-                        if os.path.exists(backend_dir):
-                            logger.info(f"Backend directory contents: {os.listdir(backend_dir)}")
-                        if os.path.exists(frontend_dir):
-                            logger.info(f"Frontend directory contents: {os.listdir(frontend_dir)}")
-                    except Exception as e:
-                        logger.error(f"Error listing project contents: {str(e)}")
-                    
-                    # Deploy the project if requested
-                    if st.session_state.deploy_services and deployer_agent:
-                        logger.info("Deploying integrated project...")
-                        deployment_result = await deployer_agent.deploy_project(project_dir)
-                        
-                        if deployment_result["status"] == "success":
-                            logger.info("Project deployed successfully")
-                            backend_url = deployment_result["backend_url"]
-                            frontend_url = deployment_result["frontend_url"]
-                            st.session_state.backend_url = backend_url
-                            st.session_state.frontend_url = frontend_url
-                            
-                            deployment_info = f"""
-## Deployment
-Your application has been deployed and is running at:
-
-- Backend API: [{backend_url}]({backend_url})
-- Frontend UI: [{frontend_url}]({frontend_url})
-
-The services will remain running until you close this application or click "Stop Services" in the sidebar.
-"""
-                            project_info = f"""
-## Project Integration
-A complete project has been assembled at: `{project_dir}`
-
-- Backend code is in the `backend/` directory
-- Frontend code is in the `frontend/` directory
-- A README.md with setup instructions is included
-{deployment_info}
-"""
-                        else:
-                            logger.error(f"Project deployment failed: {deployment_result['message']}")
-                            project_info = f"""
-## Project Integration
-A complete project has been assembled at: `{project_dir}`
-
-- Backend code is in the `backend/` directory
-- Frontend code is in the `frontend/` directory
-- A README.md with setup instructions is included
-
-**Deployment failed:** {deployment_result['message']}
-"""
-                    else:
-                        project_info = f"""
-## Project Integration
-A complete project has been assembled at: `{project_dir}`
-
-- Backend code is in the `backend/` directory
-- Frontend code is in the `frontend/` directory
-- A README.md with setup instructions is included
-"""
-                else:
-                    logger.error(f"Project integration failed, directory not created: {project_dir}")
-            
-            # Return both backend and UI code if available
-            if needs_ui and generated_ui:
-                return req_text, {
-                    "backend_code": generated_code,
-                    "ui_code": generated_ui,
-                    "project_info": project_info
-                }
-            else:
-                return req_text, generated_code
-                
-        except Exception as e:
-            logger.error(f"Error during code generation: {str(e)}")
-            return req_text, None
-        finally:
-            await code_agent.stop()
-            if ui_agent:
-                await ui_agent.stop()
-            await integrator_agent.stop()
-            # Don't stop the deployer agent here as we want services to stay running
     except Exception as e:
-        logger.error(f"Error in direct requirements to code process: {str(e)}")
-        # Return a default message in case of complete failure
-        return f"I couldn't properly analyze your requirements due to an error: {str(e)}", None
+        logger.error(f"Error in FastAPI workflow: {str(e)}")
+        return f"I couldn't properly generate your project due to an error: {str(e)}", None
 
 def _check_if_ui_needed(requirements_json, requirements_text):
     """Check if UI generation is needed based on requirements"""
@@ -577,77 +660,54 @@ def _check_if_ui_needed(requirements_json, requirements_text):
     return False
 
 def get_agent_response(message, is_code_generation=False):
-    """Get a response from the agent (synchronous wrapper)"""
-    if not st.session_state.agent or not st.session_state.agent_running:
-        initialize_agent()
-    
-    if st.session_state.agent:
-        # Add the message to the agent's queue and get a message ID
-        message_id = st.session_state.agent.add_message(st.session_state.user_id, message)
+    """Get a response via FastAPI (synchronous wrapper)"""
+    try:
+        # Call FastAPI for requirements analysis
+        result = run_async(call_fastapi_endpoint("/api/analyze-requirements", {
+            "message": message,
+            "output_format": "text"
+        }))
+        analysis = result.get("result", "")
         
-        # For code generation, we can't use the direct generation method
-        if not is_code_generation:
-            # Try direct generation for faster response
-            try:
-                direct_response = run_async(st.session_state.agent.generate_response(message))
-                if direct_response:
-                    return direct_response
-            except Exception as e:
-                logger.error(f"Error getting direct response: {str(e)}")
-        
-        # Wait for queued response
-        try:
-            return run_async(st.session_state.agent.get_response(message_id, timeout=60))  # Longer timeout for code gen
-        except Exception as e:
-            logger.error(f"Error getting queued response: {str(e)}")
-            return f"Error: {str(e)}"
-    else:
-        return "Agent is not running. Please refresh the page."
+        # For now, return the analysis as the response
+        # You can enhance this later with a dedicated chat endpoint if needed
+        if analysis:
+            return f"Based on your request: {message}\n\n{analysis}"
+        else:
+            return f"I received your message: {message}\n\nPlease provide more details about what you'd like me to help with."
+    except Exception as e:
+        logger.error(f"Error getting response from FastAPI: {str(e)}")
+        return f"Error communicating with FastAPI: {str(e)}\n\nPlease ensure FastAPI is running at {API_BASE_URL}"
 
 # Main application header
 st.title("🤖 Mother of Bots - Multi-Agent Chat Interface")
-st.subheader(f"Using {OLLAMA_MODEL} for responses")
+st.subheader(f"Using {OLLAMA_MODEL} via LangChain 🦜️")
 
 # Sidebar with info and controls
 with st.sidebar:
     st.markdown("## About")
     st.markdown("""
     This is a chat interface for the Mother of Bots multi-agent system. 
-    It uses Ollama for language model responses and SPADE for agent communication.
+    It uses **LangChain** with Ollama for language model responses and **FastAPI** for agent orchestration.
+    
+    **Powered by LangChain** 🦜️ **FastAPI** ⚡
     """)
     
-    st.markdown("## Agent Type")
-    agent_type = st.radio(
-        "Select agent type:",
-        ["standalone", "spade"],
-        index=0 if st.session_state.agent_type == "standalone" else 1,
-        help="Standalone mode doesn't require XMPP. SPADE mode uses XMPP for a full multi-agent system."
-    )
-    
-    # If agent type changed, stop the current agent
-    if agent_type != st.session_state.agent_type and st.session_state.agent_running:
-        end_agent_session()
-        st.session_state.agent_type = agent_type
-    elif agent_type != st.session_state.agent_type:
-        st.session_state.agent_type = agent_type
-    
-    # Display SPADE mode information
-    if st.session_state.agent_type == "spade":
-        st.info("""
-        **SPADE Multi-Agent Mode Active** 
-        
-        In this mode, the system uses multiple specialized agents:
-        
-        1. **UserInteractionAgent**: Handles your requests 
-        2. **RequirementsSenderAgent**: Analyzes your requirements
-        3. **CodeGenerationAgent**: Generates backend Python code only
-        4. **UIGenerationAgent**: Generates React UI components only
-        5. **IntegratorAgent**: Combines backend and UI into a ready-to-use project
-        6. **DeployerAgent**: Deploys the integrated project to localhost servers
-        
-        Each agent has a specific role and they communicate through the XMPP protocol.
-        The complete workflow automatically builds, integrates, and deploys your application.
-        """)
+    st.markdown("## FastAPI Status")
+    api_status = st.empty()
+    try:
+        async def check_api():
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{API_BASE_URL}/health")
+                return response.status_code == 200
+        api_healthy = run_async(check_api())
+        if api_healthy:
+            api_status.success(f"✅ FastAPI is running at {API_BASE_URL}")
+        else:
+            api_status.error(f"❌ FastAPI not responding at {API_BASE_URL}")
+    except Exception as e:
+        api_status.error(f"❌ Cannot connect to FastAPI: {str(e)}")
+        st.warning(f"Please ensure FastAPI is running:\n`uvicorn mother_of_bots.api:app --reload`")
     
     st.markdown("## Interface Settings")
     show_analysis = st.checkbox("Show requirements analysis", value=st.session_state.show_analysis, 
@@ -684,6 +744,29 @@ with st.sidebar:
                 st.success("Services stopped successfully")
                 st.rerun()
     
+    st.markdown("## LangChain Status")
+    langchain_status = st.empty()
+    
+    # Check LangChain availability and connection
+    try:
+        from langchain_community.llms import Ollama
+        
+        # Try to actually initialize LangChain Ollama LLM to verify connection
+        try:
+            test_llm = Ollama(
+                model=OLLAMA_MODEL,
+                base_url=OLLAMA_URL
+            )
+            # If initialization succeeds, LangChain can connect
+            langchain_status.success("✅ LangChain is active and ready")
+            st.info(f"**Using LangChain** with Ollama ({OLLAMA_MODEL})\n\nAll LLM operations use LangChain:\n- Requirements Analysis\n- Code Generation\n- UI Generation\n- User Interactions")
+        except Exception as e:
+            langchain_status.warning(f"⚠️ LangChain initialized but connection test failed: {str(e)}")
+            st.warning(f"LangChain is installed but may have connection issues with Ollama:\n`{str(e)}`\n\nPlease verify:\n- Ollama is running at {OLLAMA_URL}\n- Model '{OLLAMA_MODEL}' is available")
+    except ImportError as e:
+        langchain_status.error(f"❌ LangChain not available: {str(e)}")
+        st.warning("Please install LangChain: `pip install langchain langchain-community`")
+    
     st.markdown("## Ollama Status")
     ollama_status = st.empty()
     
@@ -701,25 +784,6 @@ with st.sidebar:
     except ImportError:
         st.error("Requests library not installed. Cannot check Ollama status.")
     
-    # If using SPADE, show XMPP status
-    if st.session_state.agent_type == "spade":
-        st.markdown("## XMPP Status")
-        xmpp_status = st.empty()
-        
-        try:
-            # Check if XMPP server is reachable (basic TCP check)
-            import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex((XMPP_SERVER, XMPP_PORT))
-            sock.close()
-            
-            if result == 0:
-                xmpp_status.success(f"XMPP server reachable at {XMPP_SERVER}:{XMPP_PORT}")
-            else:
-                xmpp_status.error(f"Cannot connect to XMPP server at {XMPP_SERVER}:{XMPP_PORT}")
-        except Exception as e:
-            xmpp_status.error(f"Error checking XMPP server: {str(e)}")
     
     st.markdown("## Settings")
     if st.button("Reset Conversation"):
@@ -751,21 +815,14 @@ with st.sidebar:
     Deployment is enabled by default - your application will automatically run on localhost when generated.
     """)
     
-    # Display success or info message based on agent type
-    if st.session_state.agent_type == "spade":
-        st.sidebar.success("SPADE multi-agent system is handling your request!")
-    else:
-        st.sidebar.info("Standalone mode is processing your request.")
+    st.sidebar.info("FastAPI mode is processing your request.")
     
-    st.markdown("## Agent Status")
+    st.markdown("## System Status")
     if st.session_state.agent_running:
-        st.success(f"Agent is running ({st.session_state.agent_type} mode)")
-        if st.button("Stop Agent"):
-            end_agent_session()
-            st.rerun()
+        st.success("✅ System is ready (FastAPI mode)")
     else:
-        st.warning("Agent is not running")
-        if st.button("Start Agent"):
+        st.warning("System not initialized")
+        if st.button("Initialize System"):
             initialize_agent()
             st.rerun()
 
@@ -787,6 +844,21 @@ for i, message in enumerate(st.session_state.messages):
         avatar = "🔎"
         
     with st.container():
+        # Display user messages with document attachments
+        if message["role"] == "user" and message.get("documents"):
+            doc_badges = " ".join([f"📎 {doc}" for doc in message.get("documents", [])])
+            message_content = f"{message['content']}\n\n<div style='margin-top: 0.5rem; font-size: 0.85em; opacity: 0.8;'>{doc_badges}</div>"
+            st.markdown(f"""
+            <div class="chat-message {message['role']}">
+                <div class="message">
+                    <b>{avatar} {message['role'].title()}</b>
+                    <br>
+                    {message_content}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            continue
+        
         # Special handling for requirements analysis (system messages)
         if message["role"] == "system" and "Requirements Analysis" in message["content"]:
             st.markdown(f"""
@@ -867,13 +939,103 @@ for i, message in enumerate(st.session_state.messages):
             </div>
             """, unsafe_allow_html=True)
 
+# File uploader section
+st.markdown("### 📎 Upload Documents")
+uploaded_files = st.file_uploader(
+    "Upload documents (PDF, DOCX, TXT, XLSX)",
+    type=["pdf", "docx", "doc", "txt", "xlsx", "xls"],
+    accept_multiple_files=True,
+    help="Upload documents to include in the conversation context"
+)
+
+# Process uploaded files
+if uploaded_files:
+    for uploaded_file in uploaded_files:
+        # Check if file is already processed
+        file_already_uploaded = any(doc["name"] == uploaded_file.name for doc in st.session_state.uploaded_documents)
+        
+        if not file_already_uploaded:
+            with st.spinner(f"Processing {uploaded_file.name}..."):
+                doc_info = process_uploaded_file(uploaded_file)
+                if doc_info:
+                    st.session_state.uploaded_documents.append(doc_info)
+                    st.success(f"✅ {uploaded_file.name} processed successfully ({len(doc_info['content'])} characters)")
+
+# Display uploaded documents
+if st.session_state.uploaded_documents:
+    with st.expander(f"📚 Uploaded Documents ({len(st.session_state.uploaded_documents)})", expanded=False):
+        for i, doc in enumerate(st.session_state.uploaded_documents):
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"**{doc['name']}** ({doc['type']}, {doc['size']} bytes)")
+                st.text_area(
+                    "Preview",
+                    doc['preview'],
+                    height=100,
+                    key=f"doc_preview_{i}",
+                    disabled=True
+                )
+            with col2:
+                if st.button("Remove", key=f"remove_doc_{i}"):
+                    st.session_state.uploaded_documents.pop(i)
+                    st.rerun()
+
 # Chat input
 user_input = st.chat_input("Type your message here...")
 
 # Process user input
 if user_input and not st.session_state.waiting_for_response:
+    # Check total message size before processing
+    estimated_size = len(user_input)
+    if st.session_state.uploaded_documents:
+        for doc in st.session_state.uploaded_documents:
+            estimated_size += len(doc.get('content', ''))
+    
+    # Warn if message is very large
+    if estimated_size > 50000:  # 50KB
+        st.warning(f"⚠️ Large message detected ({estimated_size:,} characters). Processing may take longer and use more memory.")
+    
+    # Prepare message with document context
+    message_content = user_input
+    attached_docs = []
+    
+    # Include document content if documents are uploaded
+    # Limit document content to prevent memory issues and message length problems
+    if st.session_state.uploaded_documents:
+        doc_context = "\n\n--- Uploaded Documents Context ---\n"
+        max_doc_length = 3000  # Reduced to 3000 chars per document to prevent memory issues
+        max_total_length = 10000  # Maximum total document context length
+        total_length = 0
+        
+        for doc in st.session_state.uploaded_documents:
+            if total_length >= max_total_length:
+                doc_context += f"\n[Document: {doc['name']} - Content omitted due to size limits]\n"
+                continue
+                
+            doc_content = doc['content']
+            remaining_space = max_total_length - total_length
+            doc_max_length = min(max_doc_length, remaining_space - 200)  # Reserve space for formatting
+            
+            if len(doc_content) > doc_max_length:
+                doc_content = doc_content[:doc_max_length] + f"\n\n[Document truncated - showing first {doc_max_length} characters of {len(doc['content'])} total]"
+            
+            doc_context += f"\n[Document: {doc['name']}]\n{doc_content}\n"
+            total_length += len(doc_content)
+            
+            if total_length >= max_total_length:
+                doc_context += "\n[Additional documents omitted due to size limits]"
+                break
+        
+        message_content = f"{user_input}\n{doc_context}"
+        attached_docs = [doc['name'] for doc in st.session_state.uploaded_documents]
+    
     # Add user message to chat
-    st.session_state.messages.append({"role": "user", "content": user_input})
+    message_data = {
+        "role": "user",
+        "content": user_input,
+        "documents": attached_docs
+    }
+    st.session_state.messages.append(message_data)
     
     # Set waiting flag
     st.session_state.waiting_for_response = True
@@ -883,10 +1045,47 @@ if user_input and not st.session_state.waiting_for_response:
 
 # Process response (after rerun)
 if st.session_state.waiting_for_response:
+    # Force garbage collection before processing to free memory
+    gc.collect()
+    
     with st.status("Processing...", expanded=True) as status:
-        # Get the last user message
-        last_user_message = next((msg["content"] for msg in reversed(st.session_state.messages) 
-                                if msg["role"] == "user"), "")
+        # Get the last user message with document context
+        last_user_message_obj = next((msg for msg in reversed(st.session_state.messages) 
+                                     if msg["role"] == "user"), None)
+        
+        if last_user_message_obj:
+            last_user_message = last_user_message_obj["content"]
+            # Include document content if documents were attached
+            # Limit document content to prevent memory issues and message length problems
+            if last_user_message_obj.get("documents") and st.session_state.uploaded_documents:
+                doc_context = "\n\n--- Uploaded Documents Context ---\n"
+                max_doc_length = 3000  # Reduced to 3000 chars per document
+                max_total_length = 10000  # Maximum total document context length
+                total_length = 0
+                
+                for doc in st.session_state.uploaded_documents:
+                    if doc['name'] in last_user_message_obj.get("documents", []):
+                        if total_length >= max_total_length:
+                            doc_context += f"\n[Document: {doc['name']} - Content omitted due to size limits]\n"
+                            continue
+                            
+                        doc_content = doc['content']
+                        remaining_space = max_total_length - total_length
+                        doc_max_length = min(max_doc_length, remaining_space - 200)  # Reserve space for formatting
+                        
+                        if len(doc_content) > doc_max_length:
+                            doc_content = doc_content[:doc_max_length] + f"\n\n[Document truncated - showing first {doc_max_length} characters of {len(doc['content'])} total]"
+                        
+                        doc_context += f"\n[Document: {doc['name']}]\n{doc_content}\n"
+                        total_length += len(doc_content)
+                        
+                        if total_length >= max_total_length:
+                            doc_context += "\n[Additional documents omitted due to size limits]"
+                            break
+                
+                last_user_message = f"{last_user_message}\n{doc_context}"
+        else:
+            last_user_message = ""
         
         # Determine if this is a code generation request
         code_keywords = ["generate code", "create code", "write code", "code for", "generate a program", 
@@ -931,21 +1130,31 @@ if st.session_state.waiting_for_response:
                 # Direct code generation path
                 logger.info("Detected code generation request, processing directly")
                 
-                if st.session_state.agent_type == "spade":
-                    st.write("Processing with SPADE multi-agent system...")
-                    status.update(label="Analyzing requirements with SPADE agents...", state="running")
-                else:
-                    st.write("Analyzing requirements and generating code...")
-                    status.update(label="Generating code...", state="running")
+                status.update(label="Step 1/5: Analyzing requirements...", state="running")
+                st.write("🤖 Creating your chatbot...")
+                st.write("📋 Step 1: Analyzing requirements")
                 
-                # Directly analyze requirements and generate code without intermediate steps
-                requirements_text, generated_code = run_async(direct_requirements_to_code(last_user_message))
-                
-                if generated_code:
-                    # Check if we received a dict with both backend and UI code
-                    if isinstance(generated_code, dict) and "backend_code" in generated_code and "ui_code" in generated_code:
-                        # Format the response with both requirements, backend code, and UI code
-                        response = f"""## Requirements Analysis
+                try:
+                    # Directly analyze requirements and generate code without intermediate steps
+                    status.update(label="Step 2/5: Generating backend code...", state="running")
+                    st.write("⚙️ Step 2: Generating backend code")
+                    
+                    status.update(label="Step 3/5: Generating UI...", state="running")
+                    st.write("🎨 Step 3: Generating user interface")
+                    
+                    status.update(label="Step 4/5: Integrating project...", state="running")
+                    st.write("🔗 Step 4: Integrating components")
+                    
+                    status.update(label="Step 5/5: Deploying...", state="running")
+                    st.write("🚀 Step 5: Deploying your chatbot")
+                    
+                    requirements_text, generated_code = run_async(direct_requirements_to_code(last_user_message))
+                    
+                    if generated_code:
+                        # Check if we received a dict with both backend and UI code
+                        if isinstance(generated_code, dict) and "backend_code" in generated_code and "ui_code" in generated_code:
+                            # Format the response with both requirements, backend code, and UI code
+                            response = f"""## Requirements Analysis
 {requirements_text}
 
 ## Generated Backend Code (Python)
@@ -960,9 +1169,9 @@ if st.session_state.waiting_for_response:
 
 {generated_code.get('project_info', '')}
 """
-                    else:
-                        # Format the response with both requirements and code (backend only)
-                        response = f"""## Requirements Analysis
+                        else:
+                            # Format the response with both requirements and code (backend only)
+                            response = f"""## Requirements Analysis
 {requirements_text}
 
 ## Generated Backend Code (Python)
@@ -970,20 +1179,44 @@ if st.session_state.waiting_for_response:
 {generated_code}
 ```
 """
-                    
-                    if st.session_state.agent_type == "spade":
-                        logger.info("SPADE multi-agent code generation completed successfully")
+                        
+                        logger.info("FastAPI code generation completed successfully")
                     else:
-                        logger.info("Standalone code generation completed successfully")
-                else:
-                    # Fallback to normal response if code generation failed
-                    logger.warning("Code generation failed, falling back to normal response")
-                    response = get_agent_response(last_user_message)
+                        # Fallback to normal response if code generation failed
+                        logger.warning("Code generation failed, falling back to normal response")
+                        response = get_agent_response(last_user_message)
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(f"Error in code generation workflow: {error_msg}")
+                    
+                    # Provide helpful error message
+                    if "API Error" in error_msg or "Connection error" in error_msg:
+                        response = f"""## ⚠️ Error Generating Chatbot
+
+I encountered an error while creating your chatbot:
+
+**Error:** {error_msg}
+
+**Troubleshooting:**
+1. Make sure the FastAPI server is running: `uvicorn mother_of_bots.api:app --reload`
+2. Check that Ollama is running and the model is available
+3. Try simplifying your request or breaking it into smaller parts
+4. Check the API logs for more details
+
+**Your request was:** {last_user_message[:200]}...
+"""
+                    else:
+                        response = f"""## ⚠️ Error Generating Chatbot
+
+I encountered an error: {error_msg}
+
+Please try again or simplify your request.
+"""
             else:
                 # Regular chat path with separate requirements analysis
                 if st.session_state.show_analysis:
-                    st.write("Step 1: Analyzing requirements...")
-                    status.update(label="Analyzing requirements...", state="running")
+                    st.write("Step 1: Analyzing requirements using LangChain...")
+                    status.update(label="Analyzing requirements with LangChain...", state="running")
                     
                     # Get requirements analysis
                     requirements_analysis = run_async(get_requirements_analysis(last_user_message))
@@ -1000,8 +1233,8 @@ if st.session_state.waiting_for_response:
                     st.rerun()  # Rerun to show the analysis before generating response
                 
                 # Generate regular response
-                st.write("Generating response...")
-                status.update(label="Generating response...", state="running")
+                st.write("Generating response using LangChain...")
+                status.update(label="Generating response with LangChain...", state="running")
                 response = get_agent_response(last_user_message)
             
             # Add bot message to chat
@@ -1018,6 +1251,8 @@ if st.session_state.waiting_for_response:
         finally:
             # Reset waiting flag
             st.session_state.waiting_for_response = False
+            # Force garbage collection after processing
+            gc.collect()
     
     # Rerun to display bot message
     st.rerun()

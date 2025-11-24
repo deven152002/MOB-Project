@@ -1,8 +1,8 @@
-import aiohttp
 import logging
 import os
 import json
 from typing import Dict, Any, Optional, Union, Tuple
+from langchain_community.llms import Ollama
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 # Get Ollama settings from environment variables
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:latest")
-OLLAMA_API_ENDPOINT = f"{OLLAMA_URL}/api/generate"
 
 async def analyze_requirements(message: str, output_format: str = "text") -> Union[str, Dict[str, Any]]:
     """
@@ -63,46 +62,39 @@ Only include categories that apply to the user's request. Be concise but compreh
     # Construct prompt for Ollama with instructions to analyze requirements
     prompt = f"System: {system_prompt}\n\nUser input: {message}\n\nAnalysis:"
     
-    # Prepare request payload
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.1,  # Low temperature for more factual/analytical response
-            "num_predict": 500,  # Limit token count for analysis
-        }
-    }
-    
     try:
-        # Make async request to Ollama API
-        async with aiohttp.ClientSession() as session:
-            async with session.post(OLLAMA_API_ENDPOINT, json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    analysis_text = result.get("response", "").strip()
-                    
-                    if output_format == "json":
-                        # Try to parse as JSON
-                        try:
-                            json_result = parse_json_result(analysis_text)
-                            logger.info(f"Requirements analysis completed successfully as JSON")
-                            return json_result
-                        except Exception as e:
-                            logger.error(f"Failed to parse JSON response: {str(e)}")
-                            # Fallback to text format
-                            formatted_analysis = format_analysis_for_display(analysis_text)
-                            return formatted_analysis
-                    else:
-                        # Format for better display in UI
-                        formatted_analysis = format_analysis_for_display(analysis_text)
-                        
-                        logger.info(f"Requirements analysis completed successfully as text")
-                        return formatted_analysis
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Ollama API error: {response.status} - {error_text}")
-                    return f"Error analyzing requirements: HTTP {response.status}"
+        # Use LangChain Ollama LLM
+        logger.info(f"[LangChain] Initializing Ollama LLM via LangChain for requirements analysis (model: {OLLAMA_MODEL})")
+        llm = Ollama(
+            model=OLLAMA_MODEL,
+            base_url=OLLAMA_URL,
+            temperature=0.1,  # Low temperature for more factual/analytical response
+            num_predict=500  # Limit token count for analysis
+        )
+        
+        # Invoke asynchronously using LangChain
+        logger.info(f"[LangChain] Invoking requirements analysis via LangChain ainvoke()")
+        analysis_text = await llm.ainvoke(prompt)
+        logger.info(f"[LangChain] Requirements analysis completed via LangChain ({len(analysis_text)} chars)")
+        analysis_text = analysis_text.strip()
+        
+        if output_format == "json":
+            # Try to parse as JSON
+            try:
+                json_result = parse_json_result(analysis_text)
+                logger.info(f"Requirements analysis completed successfully as JSON")
+                return json_result
+            except Exception as e:
+                logger.error(f"Failed to parse JSON response: {str(e)}")
+                # Fallback to text format
+                formatted_analysis = format_analysis_for_display(analysis_text)
+                return formatted_analysis
+        else:
+            # Format for better display in UI
+            formatted_analysis = format_analysis_for_display(analysis_text)
+            
+            logger.info(f"Requirements analysis completed successfully as text")
+            return formatted_analysis
     except Exception as e:
         logger.error(f"Exception during requirements analysis: {str(e)}")
         return f"Failed to analyze requirements: {str(e)}"
@@ -194,37 +186,4 @@ async def analyze_and_format_for_code_generation(message: str) -> Tuple[str, Dic
         return text_output, json_output
     else:
         # If JSON generation failed, we already have text output
-        return json_output, {}
-
-# Example usage for testing (when run directly)
-if __name__ == "__main__":
-    import asyncio
-    
-    async def test_analyzer():
-        # Test standard text output
-        text_requirements = await analyze_requirements(
-            "I want a chatbot for teaching Python with quizzes and examples."
-        )
-        print("\n=== TEXT OUTPUT ===")
-        print(text_requirements)
-        
-        # Test JSON output
-        json_requirements = await analyze_requirements(
-            "I want a chatbot for teaching Python with quizzes and examples.",
-            output_format="json"
-        )
-        print("\n=== JSON OUTPUT ===")
-        if isinstance(json_requirements, dict):
-            print(json.dumps(json_requirements, indent=2))
-        else:
-            print(json_requirements)
-        
-        # Test combined output
-        text, json_data = await analyze_and_format_for_code_generation(
-            "I want a chatbot for teaching Python with quizzes and examples."
-        )
-        print("\n=== COMBINED OUTPUT ===")
-        print("Text:", text[:100] + "...")
-        print("JSON:", json_data if isinstance(json_data, dict) else "Failed to generate JSON")
-    
-    asyncio.run(test_analyzer()) 
+        return json_output, {} 

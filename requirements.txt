@@ -1,0 +1,40 @@
+# Core dependencies
+python-dotenv>=1.0.0
+nest-asyncio>=1.5.6
+
+# LangChain dependencies
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-core>=0.1.0
+
+# FastAPI and web server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+httpx>=0.25.0
+
+# Streamlit for UI
+streamlit>=1.28.0
+
+# HTTP client for API calls
+requests>=2.31.0
+
+# Async support
+aiohttp>=3.9.0
+
+# Data validation
+pydantic>=2.0.0
+
+# Database (if needed)
+sqlalchemy>=2.0.0
+
+# Document processing
+PyPDF2>=3.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+# Note: .doc files require LibreOffice to be installed on the system
+# Install: macOS: brew install --cask libreoffice
+#          Linux: sudo apt-get install libreoffice
+#          Windows: Download from https://www.libreoffice.org/
+
+# Note: SPADE has been removed - using FastAPI for agent orchestration instead
+
